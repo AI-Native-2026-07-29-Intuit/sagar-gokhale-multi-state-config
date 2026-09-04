@@ -1,0 +1,178 @@
+# manifests/10-multistate-api.deployment.yaml - the workload.
+#
+# Pinned to an explicit image tag (never :latest — a moving tag makes the
+# rollout non-reproducible and gives `kubectl rollout undo` nothing stable to
+# roll back to). Zero-downtime rollout defaults, the three-probe pattern, and
+# the non-root UID baked into the W5 D1 distroless image.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: multistate-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 3
+  # How long the Deployment may make no progress before it stops waiting and
+  # reports ProgressDeadlineExceeded. The default is 600s, which is LONGER
+  # than the 8m timeout the CI job gives `kubectl rollout status` — so a bad
+  # image would surface in CI as the generic "timed out waiting for the
+  # condition" rather than the real reason. 300s puts the Deployment's own
+  # verdict first, so the failure names itself.
+  progressDeadlineSeconds: 300
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multistate-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0 # never drop below `replicas` during a rollout
+      maxSurge: 1 # at most one extra pod at a time
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multistate-api # MUST match the selector above
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: multistate
+      annotations:
+        # envFrom injects the ConfigMap/Secret as environment variables, and env
+        # vars are fixed at container start — editing either object does NOT
+        # restart the pods, so a `kubectl apply` of new config silently leaves
+        # every replica running the old values. Changing a pod-template
+        # annotation is what makes the template hash differ and forces a real
+        # rolling update, so these hashes are the thing that ties config content
+        # to a rollout. CI recomputes both before applying;
+        # `kubectl rollout restart deploy/multistate-api` is the local kill switch.
+        checksum/config: "replace-at-apply-time"
+        checksum/secret: "replace-at-apply-time"
+    spec:
+      # Pod shutdown is not instantaneous and must not be treated as such.
+      # When a pod is deleted, two things happen CONCURRENTLY, not in order:
+      # the kubelet starts terminating the container, and the endpoint
+      # controller removes it from the EndpointSlice, which the ingress
+      # controller then has to observe and reload. Nothing synchronises those.
+      # So there is a window where NGINX still forwards traffic to a pod that
+      # has already begun shutting down — which is exactly how a rollout that
+      # is "zero-downtime" by replica count still drops real requests.
+      #
+      # preStop delays SIGTERM, keeping the pod serving through that window
+      # while endpoint removal propagates. This uses the native `sleep` action
+      # rather than `exec: ["sleep", "5"]` because the distroless image has no
+      # shell or sleep binary for an exec handler to invoke.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532 # the distroless nonroot UID from W5 D1
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: multistate-api
+          image: uptimecrew/multistate-api:0.1.1
+          # IfNotPresent, not Always: the image is side-loaded into the nodes'
+          # containerd cache with `k3d image import` and does not exist in any
+          # registry, so Always would fail the pull outright.
+          imagePullPolicy: IfNotPresent
+          # Hold off SIGTERM long enough for this pod's removal to reach the
+          # ingress controller's upstream list. 5s comfortably covers the
+          # endpoint-propagation + NGINX-reload path on this cluster, and is
+          # well inside terminationGracePeriodSeconds above (which must exceed
+          # this sleep plus the app's own graceful-shutdown budget, or the
+          # kubelet SIGKILLs mid-drain and undoes the point of both).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: multistate-api-config
+            - secretRef:
+                name: multistate-api-secrets
+          env:
+            # The JVM sizes its default heap from what it believes is the
+            # machine's RAM. Inside a container that used to mean the HOST's
+            # RAM, so a 1Gi-limited pod on a 32Gi node would happily grow an
+            # 8Gi heap and get OOMKilled by the kernel long before the GC ever
+            # considered collecting. Modern JVMs are cgroup-aware, but the
+            # default MaxRAMPercentage of 25% is far too conservative for a
+            # container whose whole job is running this one process.
+            #
+            # ExitOnOutOfMemoryError matters just as much: without it a heap
+            # exhaustion leaves the JVM alive but thrashing, still passing the
+            # liveness probe while serving nothing. Dying is the honest signal
+            # — it lets the restart policy and the rollout do their jobs.
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+
+          # ── resources ───────────────────────────────────────────────────────
+          # requests = the scheduler's floor and the pod's share of contended
+          # CPU. Booting Spring Boot on the LimitRange default of 100m took
+          # ~150s and lost races with the startup probe; 250m is what makes the
+          # boot budget realistic.
+          #
+          # NO limits.cpu on purpose. A CPU limit is enforced by CFS throttling,
+          # which caps the process every 100ms period even when the node is
+          # idle — that penalises exactly the bursty work (JVM warmup, JIT, GC)
+          # this app does at startup, for no isolation benefit that requests
+          # don't already provide. Memory IS limited, because memory is
+          # incompressible: there is no "throttle" for it, only the OOM killer,
+          # so an unbounded leak would take the whole node's neighbours with it.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+
+          # ── the three probes ────────────────────────────────────────────────
+          # All three are httpGet, never exec: the W5 D1 image is distroless and
+          # has no shell or binaries for an exec probe to invoke.
+          #
+          # startupProbe owns the boot window and suppresses the other two until
+          # it passes once. Without it the only way to survive a 25-40s Spring
+          # Boot cold start is a large initialDelaySeconds on liveness — which
+          # then applies for the pod's whole life, delaying detection of a wedge
+          # by that same amount forever. The startup probe lets boot be slow and
+          # steady-state detection stay fast.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30 # 30 x 5s = 150s of grace before giving up
+            timeoutSeconds: 3
+
+          # "Is this JVM wedged?" -> failing restarts the pod. Points at the
+          # liveness group, which application.yml narrows to livenessState only
+          # and deliberately excludes db/mongo/redis: a shared Postgres outage
+          # would otherwise fail this probe on every replica simultaneously and
+          # turn a recoverable dependency blip into a cluster-wide restart storm.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            initialDelaySeconds: 0 # startupProbe already owns the boot wait
+
+          # "Can this pod serve a request right now?" -> failing pulls it from
+          # the Service's EndpointSlice but leaves it Running, so it rejoins on
+          # its own once the dependency recovers. A DISTINCT path from liveness
+          # is the whole point: this group includes db/mongo/redis, so a pod that
+          # lost Postgres stops receiving traffic without being restarted.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+            initialDelaySeconds: 0

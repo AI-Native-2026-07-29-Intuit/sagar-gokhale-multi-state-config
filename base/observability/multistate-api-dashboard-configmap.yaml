@@ -1,0 +1,40 @@
+# manifests/observability/multistate-api-dashboard-configmap.yaml
+#
+# Dashboards as code: the JSON in .grafana/dashboards/ is the source of
+# truth in git. scripts/observability-apply.sh regenerates this ConfigMap's
+# data from that file with `kubectl create configmap ... --from-file` so the
+# two never drift — hand-editing the `data:` block below is a bug, not a
+# feature.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multistate-api-grafana-dashboard
+  namespace: monitoring
+  labels:
+    # The kube-prometheus-stack Grafana sidecar watches for this label and
+    # mounts any matching ConfigMap's files under its dashboard provider path.
+    grafana_dashboard: "1"
+    app.kubernetes.io/name: multistate-api
+data: {}
+---
+# Provisioning config: created once per cluster, applied here for completeness.
+# allowUiUpdates: false is the whole point of dashboards-as-code — a click-edit
+# in Grafana shows a grey, disabled "Save" button instead of silently drifting
+# from what's committed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-provisioning
+  namespace: monitoring
+data:
+  dashboards.yaml: |-
+    apiVersion: 1
+    providers:
+      - name: capstone-dashboards
+        folder: "Capstone"
+        type: file
+        disableDeletion: true
+        allowUiUpdates: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards

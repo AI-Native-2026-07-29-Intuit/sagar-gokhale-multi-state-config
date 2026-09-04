@@ -1,0 +1,29 @@
+# manifests/observability/multistate-api-servicemonitor.yaml
+#
+# The Prometheus Operator watches ServiceMonitors matching its configured
+# selector and rewrites the Prometheus scrape config from them — nobody
+# touches prometheus.yml directly.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+  labels:
+    # MUST be present: the kube-prometheus-stack Helm chart scopes its
+    # Prometheus CR's serviceMonitorSelector to release=kube-prometheus-stack
+    # by default. Omit it and the scrape never fires — with no error anywhere,
+    # just an empty target list.
+    release: kube-prometheus-stack
+    app.kubernetes.io/name: multistate-api
+spec:
+  selector:
+    matchLabels:
+      # Matches 20-multistate-api.service.yaml's own labels (W5 D3).
+      app.kubernetes.io/name: multistate-api
+  namespaceSelector:
+    matchNames: [multistate-dev]
+  endpoints:
+    - port: http                     # the Service port NAME (W5 D3), not a number
+      path: /actuator/prometheus
+      interval: 15s
+      scrapeTimeout: 10s

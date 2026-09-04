@@ -1,0 +1,101 @@
+# manifests/06-mongo.yaml - the denormalised read model (W2 D5).
+#
+# Like Postgres, this is a startup-time hard dependency: the Spring Data Mongo
+# repositories are created eagerly and the readiness health group includes the
+# `mongo` indicator, so the app is neither startable nor Ready without it.
+# StatefulSet + volumeClaimTemplate for the same reason as Postgres: real
+# on-disk state that should survive a pod restart.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: mongo
+    app.kubernetes.io/component: read-model
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: mongo
+    app.kubernetes.io/component: read-model
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongo
+        app.kubernetes.io/component: read-model
+        app.kubernetes.io/part-of: multistate
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mongo
+              containerPort: 27017
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          # readiness = "can it actually answer a query?", so it is worth paying
+          # for a real command here. `mongosh` is a Node.js CLI whose *startup*
+          # alone costs a couple of seconds, and on a 250m-CPU-request pod
+          # sharing a k3d agent it regularly overran the old timeoutSeconds: 5
+          # even though mongod was serving traffic the whole time. 10s leaves
+          # room for interpreter boot rather than measuring it.
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 4
+          # liveness = "is this process wedged?" -> restart. It must be the
+          # CHEAPEST check that still distinguishes wedged from working, because
+          # a false negative here is a pod kill, not a de-registration. Running
+          # mongosh on this path did exactly that: the probe timed out on its own
+          # interpreter startup and restarted a healthy mongod 8 times, which is
+          # what left the pod at 0/1 with a mounting restart count. A TCP connect
+          # to the listener costs nothing and cannot time out on CPU contention.
+          livenessProbe:
+            tcpSocket:
+              port: mongo
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

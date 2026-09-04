@@ -1,0 +1,327 @@
+# manifests/04-postgres-init.configmap.yaml - GENERATED, DO NOT HAND-EDIT.
+#
+# Projects the repo's real db/*.sql migrations plus scripts/pg-seed.sh into the
+# Postgres StatefulSet's /docker-entrypoint-initdb.d, so the k8s Postgres comes
+# up with the same schema + seed the Compose stack (W5 D2) and the Testcontainers
+# suites use. The app runs Hibernate with ddl-auto: validate, so a Postgres
+# without this schema fails the app's context startup outright.
+#
+# Regenerate after ANY change to db/*.sql or scripts/pg-seed.sh:
+#   ./scripts/gen-postgres-init.sh
+# CI re-runs that script and fails if the result differs from what's committed,
+# so this file cannot silently drift from the SQL it is copied from.
+apiVersion: v1
+data:
+  V1__schema.sql: |
+    -- V1__schema.sql — Multi-State Tax Compliance Tracker
+    -- Creates the `multistate` schema and its three tables (tenant, jurisdiction,
+    -- allocation) with every constraint Postgres can enforce for us. The design is
+    -- documented in db/README.md; this file is the executable version of it.
+    --
+    -- Run with:  psql -h localhost -U postgres -f db/V1__schema.sql
+
+    -- All objects live in the `multistate` schema, never in the default `public`.
+    CREATE SCHEMA IF NOT EXISTS multistate;
+
+    -- After this, an unqualified name resolves against `multistate` first. We still
+    -- schema-qualify every table below for clarity; this just makes ad-hoc queries
+    -- in the same session convenient.
+    SET search_path TO multistate, public;
+
+
+    -- ---------------------------------------------------------------------------
+    -- tenant — one row per taxpayer entity (an individual OR a business).
+    -- This is the Week 1 `workerId`, widened: a tenant is any party that owes tax.
+    -- ---------------------------------------------------------------------------
+    CREATE TABLE multistate.tenant (
+        -- TEXT id (an opaque handle like 'tenant-a'), never SERIAL/BIGSERIAL.
+        id            TEXT PRIMARY KEY,
+
+        -- Every tenant must have a name, and a blank string is not a name.
+        -- — intent: a tenant is unusable without a display name.
+        display_name  TEXT NOT NULL CHECK (length(display_name) > 0),
+
+        -- Email is optional (nullable), but if present it must be unique — no two
+        -- tenants may share a contact address.
+        -- — intent: email is a natural key when supplied; duplicates are an error.
+        email         TEXT UNIQUE,
+
+        -- Enum-as-CHECK: a tenant is either an individual or a business. We use
+        -- TEXT + CHECK instead of a native ENUM so the allowed set is easy to alter.
+        -- — intent: only the two known taxpayer kinds are valid.
+        kind          TEXT NOT NULL CHECK (kind IN ('INDIVIDUAL', 'BUSINESS')),
+
+        -- Audit stamp: the instant the row was created. TIMESTAMPTZ (zone-aware),
+        -- defaulted to now() so callers never have to supply it.
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+
+    -- ---------------------------------------------------------------------------
+    -- jurisdiction — reference table of places income can be taxed (states, etc).
+    -- This is the Week 1 `jurisdictionCode`, promoted to a first-class table.
+    -- ---------------------------------------------------------------------------
+    CREATE TABLE multistate.jurisdiction (
+        -- The short code IS the natural id ('CA', 'NY', 'US'); it is stable and
+        -- human-meaningful, so it doubles as the primary key. TEXT, never SERIAL.
+        code           TEXT PRIMARY KEY,
+
+        -- Full name, required and unique — two jurisdictions can't share a name.
+        -- — intent: 'California' must map to exactly one code.
+        display_name   TEXT NOT NULL UNIQUE CHECK (length(display_name) > 0),
+
+        -- Enum-as-CHECK: the level of government levying the tax.
+        -- — intent: only known jurisdiction levels are valid.
+        kind           TEXT NOT NULL CHECK (kind IN ('FEDERAL', 'STATE', 'CITY')),
+
+        -- Whether this jurisdiction taxes income at all (e.g. TX = false). A plain
+        -- BOOLEAN flag, required.
+        -- — intent: some jurisdictions levy no income tax; the schema records that.
+        has_income_tax BOOLEAN NOT NULL,
+
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+
+    -- ---------------------------------------------------------------------------
+    -- allocation — the fact table: how much of a tenant's income is assigned to a
+    -- jurisdiction for a tax year. This is the Week 1 `IncomeAllocation` record.
+    -- ---------------------------------------------------------------------------
+    CREATE TABLE multistate.allocation (
+        -- Surrogate primary key, carried over 1:1 from the Week 1 record's `id`.
+        id                TEXT PRIMARY KEY,
+
+        -- FK to the owning tenant. CASCADE: if a tenant is deleted, its allocations
+        -- are meaningless orphans and should go with it.
+        -- — intent: an allocation cannot exist without its tenant (parent-child).
+        tenant_id         TEXT NOT NULL
+                          REFERENCES multistate.tenant(id) ON DELETE CASCADE,
+
+        -- FK to the jurisdiction. RESTRICT: you must NOT delete a jurisdiction that
+        -- live allocations still reference — that would corrupt financial records.
+        -- — intent: shared reference data must not be orphaned.
+        jurisdiction_code TEXT NOT NULL
+                          REFERENCES multistate.jurisdiction(code) ON DELETE RESTRICT,
+
+        -- The tax year this allocation covers. A sane calendar-year range guard.
+        -- — intent: reject typos / impossible years.
+        tax_year          INTEGER NOT NULL CHECK (tax_year BETWEEN 2000 AND 2100),
+
+        -- Money: exact 2-decimal NUMERIC, never FLOAT. Must be non-negative — this
+        -- mirrors the Week 1 record's `amount.signum() >= 0` rule.
+        -- — intent: an allocated amount is never negative.
+        amount            NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+
+        -- The calendar period the allocation is for (Week 1 `allocatedFor`). DATE,
+        -- not TIMESTAMPTZ, because this is a calendar day, not an instant.
+        allocated_for     DATE NOT NULL,
+
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        -- Natural (business) key: at most one allocation per tenant, per
+        -- jurisdiction, per tax year. The `id` above is the surrogate key; this
+        -- UNIQUE enforces the real-world "no duplicates" rule.
+        -- — intent: a tenant is allocated to a given jurisdiction once per year.
+        UNIQUE (tenant_id, jurisdiction_code, tax_year)
+    );
+
+    -- Postgres auto-indexes PRIMARY KEY and UNIQUE constraints, but NOT plain
+    -- foreign-key columns. Both FK columns are joined on in verify.sql, so index
+    -- them explicitly to keep those joins fast as the table grows.
+    -- — intent: foreign-key lookups and joins should not force a sequential scan.
+    -- (Note: tenant_id is also the leading column of the natural-key UNIQUE index
+    -- above, so it is partly covered already; jurisdiction_code is covered by
+    -- nothing and benefits most from its own index.)
+    CREATE INDEX allocation_tenant_id_idx         ON multistate.allocation (tenant_id);
+    CREATE INDEX allocation_jurisdiction_code_idx ON multistate.allocation (jurisdiction_code);
+  V2__seed.sql: |
+    -- V2__seed.sql — Multi-State Tax Compliance Tracker
+    -- Seeds the multistate schema with realistic synthetic data. Every INSERT runs
+    -- inside a SINGLE transaction: if any one INSERT fails, the whole batch rolls
+    -- back and the database is left untouched (Topic 9 — Transactions).
+    --
+    -- Run AFTER V1__schema.sql:
+    --   psql -h localhost -U postgres -f db/V2__seed.sql
+    --
+    -- NOTE: this seed is intentionally NOT idempotent. Re-running it fails on the
+    -- primary-key collision for the fixed ids below — that failure is the proof the
+    -- PRIMARY KEY constraint is real.
+
+    BEGIN;
+
+    -- Reference table first: jurisdictions have no dependencies.
+    INSERT INTO multistate.jurisdiction (code, display_name, kind, has_income_tax) VALUES
+        ('US',  'United States', 'FEDERAL', true),
+        ('CA',  'California',    'STATE',   true),
+        ('NY',  'New York',      'STATE',   true),
+        ('TX',  'Texas',         'STATE',   false),   -- Texas levies no state income tax
+        ('NYC', 'New York City', 'CITY',    true);
+
+    -- Tenants next: allocations reference them.
+    INSERT INTO multistate.tenant (id, display_name, email, kind) VALUES
+        ('tenant-a', 'Tenant A', 'a@multistate.example.internal', 'INDIVIDUAL'),
+        ('tenant-b', 'Tenant B', 'b@multistate.example.internal', 'INDIVIDUAL'),
+        ('tenant-c', 'Tenant C', 'c@multistate.example.internal', 'BUSINESS'),
+        ('tenant-d', 'Tenant D', NULL,                            'BUSINESS'),   -- email is genuinely optional
+        ('tenant-e', 'Tenant E', 'e@multistate.example.internal', 'INDIVIDUAL');
+
+    -- Allocations last: every row references a real tenant and a real jurisdiction.
+    INSERT INTO multistate.allocation
+        (id, tenant_id, jurisdiction_code, tax_year, amount, allocated_for) VALUES
+        ('alloc-2026-0001', 'tenant-a', 'CA',  2026,  75000.00, DATE '2026-12-31'),
+        ('alloc-2026-0002', 'tenant-a', 'NY',  2026,  25000.00, DATE '2026-12-31'),
+        ('alloc-2026-0003', 'tenant-b', 'CA',  2026,  50000.00, DATE '2026-12-31'),
+        ('alloc-2026-0004', 'tenant-c', 'US',  2026, 120000.00, DATE '2026-12-31'),
+        ('alloc-2026-0005', 'tenant-c', 'TX',  2026,      0.00, DATE '2026-12-31'),  -- TX: zero income tax, amount 0 is valid
+        ('alloc-2025-0006', 'tenant-a', 'CA',  2025,  60000.00, DATE '2025-12-31');  -- same tenant+jurisdiction, DIFFERENT year: allowed
+
+    COMMIT;
+
+
+    -- ---------------------------------------------------------------------------
+    -- Intentional failure test (runs OUTSIDE the seed transaction above).
+    -- Proves the CHECK (amount >= 0) constraint rejects bad data. The whole thing
+    -- is wrapped in its own BEGIN; ... ROLLBACK; so nothing persists.
+    -- ---------------------------------------------------------------------------
+    BEGIN;
+    -- This INSERT violates CHECK (amount >= 0) with a negative amount:
+    INSERT INTO multistate.allocation
+        (id, tenant_id, jurisdiction_code, tax_year, amount, allocated_for) VALUES
+        ('alloc-bad-0001', 'tenant-a', 'CA', 2026, -1.00, DATE '2026-12-31');
+    ROLLBACK;
+
+    -- Captured error message from the INSERT above (Postgres 16):
+    --
+    -- psql:db/V2__seed.sql:53: ERROR:  new row for relation "allocation" violates
+    --   check constraint "allocation_amount_check"
+    -- DETAIL:  Failing row contains (alloc-bad-0001, tenant-a, CA, 2026, -1.00,
+    --   2026-12-31, 2026-08-06 16:58:31.264265-04).
+
+
+    -- ---------------------------------------------------------------------------
+    -- Second intentional failure test: proves the tenant_id FOREIGN KEY rejects an
+    -- allocation that points at a tenant which does not exist. Again wrapped in its
+    -- own BEGIN; ... ROLLBACK; so nothing persists.
+    -- ---------------------------------------------------------------------------
+    BEGIN;
+    -- This INSERT violates the FK allocation_tenant_id_fkey (unknown tenant):
+    INSERT INTO multistate.allocation
+        (id, tenant_id, jurisdiction_code, tax_year, amount, allocated_for) VALUES
+        ('alloc-bad-0002', 'tenant-does-not-exist', 'CA', 2026, 100.00, DATE '2026-12-31');
+    ROLLBACK;
+
+    -- Captured error message from the INSERT above (Postgres 16):
+    --
+    -- psql:db/V2__seed.sql:73: ERROR:  insert or update on table "allocation"
+    --   violates foreign key constraint "allocation_tenant_id_fkey"
+    -- DETAIL:  Key (tenant_id)=(tenant-does-not-exist) is not present in table
+    --   "tenant".
+  V3__event_outbox.sql: |
+    -- V3__event_outbox.sql — Multi-State Tax Compliance Tracker
+    -- Transactional outbox (W3 D3): AllocationService.allocate(...) inserts a row
+    -- here in the SAME JPA transaction that writes the domain entity, so the
+    -- domain write and the "an event happened" fact can never disagree. A
+    -- separate OutboxPublisher sweeps unpublished rows to Kafka on its own
+    -- schedule — the outbox is what lets that sweep be async without losing
+    -- events.
+    --
+    -- Run with:  psql -h localhost -U postgres -f db/V3__event_outbox.sql
+
+    SET search_path TO multistate, public;
+
+    -- ---------------------------------------------------------------------------
+    -- event_outbox — one row per domain event awaiting (or having completed)
+    -- publication to Kafka.
+    -- ---------------------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS multistate.event_outbox (
+        -- TEXT id, generated by the application (UUID v4 string) — never a native
+        -- UUID column or SERIAL/BIGSERIAL, per this project's identifier rule.
+        id            TEXT        PRIMARY KEY,
+
+        -- The domain entity this event is about (e.g. an allocation id). Used as
+        -- the Kafka message key so all events for the same aggregate land on the
+        -- same partition and preserve per-aggregate ordering.
+        -- — intent: an outbox row must always be traceable to its aggregate.
+        aggregate_id  TEXT        NOT NULL CHECK (length(aggregate_id) > 0),
+
+        -- Destination Kafka topic. TEXT + CHECK rather than a fixed column
+        -- default: today only tenants.events is produced, but the column already
+        -- allows a future second topic without a migration.
+        -- — intent: a row is meaningless without knowing where it's headed.
+        topic         TEXT        NOT NULL CHECK (length(topic) > 0),
+
+        -- The serialised event body. JSONB (not TEXT) so the payload is queryable
+        -- if an operator ever needs to inspect a stuck row by hand.
+        payload       JSONB       NOT NULL,
+
+        -- When the domain event occurred (audit timestamp -> point in time ->
+        -- TIMESTAMPTZ, defaulted so callers never have to supply it).
+        occurred_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        -- NULL until OutboxPublisher successfully sends this row to Kafka; set
+        -- exactly once, on success. This is the field the publisher polls on.
+        published_at  TIMESTAMPTZ NULL
+    );
+
+    -- Partial index keeps OutboxPublisher's polling query cheap as the table
+    -- grows: only unpublished rows are ever visited.
+    -- — intent: the publish sweep must stay O(unpublished), not O(all history).
+    CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
+        ON multistate.event_outbox (occurred_at)
+        WHERE published_at IS NULL;
+  V4__event_outbox_traceparent.sql: |
+    -- V4__event_outbox_traceparent.sql — Multi-State Tax Compliance Tracker
+    -- W3 D5: captures the W3C traceparent header of whatever span was active when
+    -- the outbox row was inserted, so OutboxPublisher can later replay that exact
+    -- trace context onto the Kafka send instead of starting a disconnected new
+    -- trace at poll time. Without this, the outbox's async write/publish boundary
+    -- silently breaks trace continuity between "a write happened" and "it reached
+    -- Kafka" — the two would show up as two unrelated traces in Jaeger.
+    --
+    -- Run with:  psql -h localhost -U postgres -f db/V4__event_outbox_traceparent.sql
+
+    SET search_path TO multistate, public;
+
+    -- Nullable: this is observability metadata, not domain data — a row inserted
+    -- with tracing disabled (or before this column existed) is still a complete,
+    -- valid outbox row. NOT subject to this project's "identifiers are never
+    -- blank" rule; it's not an identifier, it's an optional W3C trace-context
+    -- string ("00-<32 hex trace id>-<16 hex span id>-<2 hex flags>").
+    ALTER TABLE multistate.event_outbox
+        ADD COLUMN IF NOT EXISTS traceparent TEXT NULL;
+  pg-seed.sh: |
+    #!/bin/sh
+    # scripts/pg-seed.sh - runs inside the postgres container as an
+    # /docker-entrypoint-initdb.d/*.sh script.
+    #
+    # db/V2__seed.sql intentionally contains two BEGIN;...ROLLBACK; demo blocks
+    # that violate a CHECK and a FOREIGN KEY constraint on purpose (see the
+    # file's own comments) — proof the constraints are real, not bugs. psql
+    # exits non-zero when a statement in the middle of a script fails, and the
+    # rest of docker-entrypoint.sh runs under `set -e`, so letting the default
+    # per-file invocation run that file would abort the ENTIRE init sequence
+    # and silently skip every init file after it (V3/V4's outbox tables never
+    # got created — that's what broke Hibernate schema validation the first
+    # time this stack came up). Running it explicitly with ON_ERROR_STOP=0
+    # tolerates those two expected failures without masking a real one.
+    #
+    # SEED_FILE is overridable because the two callers mount the seed at
+    # different paths: Compose (W5 D2) bind-mounts it into a subdirectory of
+    # /docker-entrypoint-initdb.d, while the Kubernetes StatefulSet (W5 D3)
+    # projects it from a ConfigMap at /seed — nesting one ConfigMap mount
+    # inside another's directory is avoidable, so it isn't done.
+    set -e
+
+    SEED_FILE="${SEED_FILE:-/docker-entrypoint-initdb.d/seed/V2__seed.sql}"
+
+    psql -v ON_ERROR_STOP=0 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+         -f "$SEED_FILE"
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+  namespace: multistate-dev

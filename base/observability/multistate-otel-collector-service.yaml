@@ -1,0 +1,29 @@
+# manifests/observability/multistate-otel-collector-service.yaml
+#
+# Stable alias Service: the opentelemetry-collector Helm chart names its own
+# Service after the release (otel-collector-opentelemetry-collector), but
+# every OTEL_EXPORTER_OTLP_ENDPOINT reference in this repo
+# (30-multistate-api.configmap.yaml, multistate-api-deployment-patch.yaml)
+# points at the shorter `otel-collector` name — decoupling the app's config
+# from this Helm release's naming, and matching CLAUDE.md's Deliverable Prep
+# install command verbatim. Selector matches the chart's own pod labels, so
+# this Service just forwards to whatever the chart deploys.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: multistate
+spec:
+  selector:
+    app.kubernetes.io/instance: otel-collector
+    app.kubernetes.io/name: opentelemetry-collector
+    component: standalone-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

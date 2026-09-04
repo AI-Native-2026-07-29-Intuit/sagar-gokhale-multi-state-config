@@ -1,0 +1,68 @@
+# manifests/observability/multistate-api-deployment-patch.yaml
+#
+# W5 D5 Task 3. Apply with:
+#   kubectl -n multistate-dev patch deployment multistate-api \
+#       --patch-file manifests/observability/multistate-api-deployment-patch.yaml
+#
+# DEVIATION FROM THE WORKSHOP REFERENCE, DOCUMENTED: the reference pattern
+# attaches tracing via a separate OTel Java agent jar (init container +
+# JAVA_TOOL_OPTIONS=-javaagent:...). This app already ships
+# `io.opentelemetry.instrumentation:opentelemetry-spring-boot-starter` on the
+# classpath (W3 D5) — the SAME auto-instrumentation the agent jar provides,
+# wired at build time instead of via a downloaded jar at pod start. Adding the
+# agent jar on top would double-instrument every request (two independent SDK
+# instances exporting the same spans). This patch instead tunes that existing
+# starter for the cluster: point it at the in-cluster Collector and switch
+# from the local-dev `always_on` sampler (application.yml) to a real
+# production sampling ratio.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+spec:
+  template:
+    spec:
+      # The public half of the W5 D5 dev-only JWT signing key (see
+      # K8sJwtDecoderConfig's Javadoc). scripts/mint-smoke-jwt.sh creates/
+      # updates this Secret from secrets/multistate_jwt_public.pem before
+      # this patch is applied.
+      volumes:
+        - name: jwt-public-key
+          secret:
+            secretName: multistate-jwt-public-key
+      containers:
+        - name: multistate-api
+          volumeMounts:
+            - name: jwt-public-key
+              mountPath: /etc/multistate/jwt
+              readOnly: true
+          env:
+            # Switches on K8sJwtDecoderConfig, which is @ConditionalOnProperty
+            # on exactly this key. It is set HERE rather than in
+            # application.yml so the bean can only ever exist when the volume
+            # mount above has actually supplied the file — the two must land
+            # together or the context fails at startup on a missing file.
+            - name: MULTISTATE_JWT_PUBLIC_KEY_LOCATION
+              value: "file:/etc/multistate/jwt/public.pem"
+            # gRPC to the in-cluster OTel Collector (the Boot starter defaults
+            # to OTLP/HTTP on 4318; the Collector's gRPC receiver is 4317).
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.monitoring.svc.cluster.local:4317"
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "grpc"
+            # Head-based sampling at 10%, parent-context aware: if an upstream
+            # caller already sampled the trace, this service samples its own
+            # spans too, so cross-service traces stay joinable instead of
+            # each hop rolling its own independent coin flip.
+            - name: OTEL_TRACES_SAMPLER
+              value: "parentbased_traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "0.1"
+            # Micrometer (Task 1) owns metrics; Logback (Task 2) owns logs.
+            # Disabling the OTel agent's own metrics/logs exporters avoids
+            # double-emitting either signal through a second pipeline.
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
+            - name: OTEL_LOGS_EXPORTER
+              value: "none"

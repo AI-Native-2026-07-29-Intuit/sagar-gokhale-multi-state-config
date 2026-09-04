@@ -1,0 +1,62 @@
+# manifests/50-multistate-api.hpa.yaml - horizontal autoscaling on CPU.
+#
+# autoscaling/v2, NOT v1: v1 is CPU-only and, more importantly, has no
+# `behavior` block, so scale-up and scale-down are forced to share one
+# reaction speed. They should not — see below.
+#
+# The target is a percentage of the container's resources.requests.cpu
+# (250m), NOT of a core. 70% of 250m = 175m average across pods before a
+# scale-up. This is the load-bearing reason a request must be set on the
+# container: with no request there is no denominator, the HPA cannot compute
+# a utilisation ratio at all, and it reports <unknown> and never scales.
+#
+# Requires metrics-server to be running in the cluster; without it TARGETS
+# stays <unknown> for the same reason.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: multistate-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: multistate-api
+  # minReplicas 2, not 1: a single replica has no headroom to absorb the
+  # traffic of a pod that is restarting or being drained during a rollout.
+  # maxReplicas 5 caps the blast radius on a laptop-sized cluster.
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  # Scale-up and scale-down are deliberately asymmetric, because the two
+  # mistakes cost very different amounts. Scaling up late means dropping real
+  # user traffic; scaling down late just means paying for an idle pod for a
+  # few more minutes. So: react to load instantly, retreat from it slowly.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0 # no damping — act on the current reading
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 15 } # double every 15s
+        - { type: Pods, value: 2, periodSeconds: 60 } # or +2/min
+      selectPolicy: Max # whichever adds capacity faster
+    scaleDown:
+      # 5 minutes of "it still looks quiet" before removing anything. Without
+      # this window a merely bursty workload oscillates: scale down, get
+      # overwhelmed, scale up, go quiet, scale down again — thrashing pods
+      # and paying a cold JVM start on every cycle.
+      stabilizationWindowSeconds: 300
+      policies:
+        - { type: Percent, value: 25, periodSeconds: 60 }
+      selectPolicy: Min # whichever removes capacity slower

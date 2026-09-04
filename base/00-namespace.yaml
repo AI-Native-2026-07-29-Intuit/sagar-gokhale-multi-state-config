@@ -1,0 +1,55 @@
+# manifests/00-namespace.yaml - the bounded blast radius for multistate-api.
+# A ResourceQuota caps total resource use for everything in the namespace; a
+# LimitRange supplies per-container defaults so a pod that omits requests or
+# limits still gets sane numbers instead of landing unbounded.
+#
+# Applied first (00- prefix) because every other manifest in this tree is
+# namespaced into multistate-dev and would fail to create without it.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multistate-dev
+  labels:
+    app.kubernetes.io/part-of: multistate
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: multistate-dev-quota
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/part-of: multistate
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.memory: 16Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: multistate-dev-defaults
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/part-of: multistate
+spec:
+  limits:
+    - type: Container
+      # Only memory is defaulted here, deliberately. Adding a `cpu` default
+      # would silently inject a CPU limit into every container that omits
+      # one — including multistate-api, which omits `limits.cpu` on purpose
+      # (see 10-multistate-api.deployment.yaml) to avoid CFS throttling on
+      # burst. A LimitRange default is indistinguishable from an explicit
+      # limit once admission has run, so the "no CPU limit" decision has to
+      # be honoured in BOTH places or it isn't honoured at all.
+      #
+      # `limits.cpu` is likewise absent from the ResourceQuota above: a quota
+      # on a resource makes that resource mandatory on every container, which
+      # would force the exact CPU limit this stack is trying not to set.
+      default:
+        memory: 768Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 256Mi

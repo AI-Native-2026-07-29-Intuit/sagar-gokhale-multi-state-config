@@ -1,0 +1,53 @@
+# argocd/applications/multistate-api-dev.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: multistate-api-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    env: dev
+    team: multistate
+spec:
+  project: multistate
+
+  source:
+    repoURL: https://github.com/AI-Native-2026-07-29-Intuit/sagar-gokhale-multi-state-config.git
+    path: overlays/dev
+    targetRevision: main
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: multistate-dev
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  # The HPA (50-multistate-api.hpa.yaml) owns spec.replicas at runtime.
+  # Without this, selfHeal fights the HPA every reconcile: HPA scales the
+  # Deployment away from base's declared replica count, Argo CD sees that as
+  # drift and reverts it, HPA scales again -- a real GitOps+HPA interaction,
+  # not curriculum boilerplate.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: multistate-api
+      namespace: multistate-dev
+      jsonPointers:
+        - /spec/replicas

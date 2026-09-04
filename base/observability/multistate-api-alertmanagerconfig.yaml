@@ -1,0 +1,69 @@
+# manifests/observability/multistate-api-alertmanagerconfig.yaml
+#
+# Routes on team: multistate (the label every alert in
+# multistate-api-prometheusrule.yaml carries). Receiver URLs are PLACEHOLDERS
+# — Week 6 wires the real Slack webhook + PagerDuty integration key into the
+# on-call rotation; today's job is making the routing tree exist and be
+# visible, not making it page anyone for real.
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+  labels:
+    release: kube-prometheus-stack
+spec:
+  route:
+    groupBy: ["alertname", "severity"]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    receiver: multistate-default
+    matchers:
+      - matchType: "="
+        name: team
+        value: multistate
+    routes:
+      - receiver: multistate-page
+        matchers:
+          - matchType: "="
+            name: severity
+            value: page
+      - receiver: multistate-ticket
+        matchers:
+          - matchType: "="
+            name: severity
+            value: ticket
+  receivers:
+    - name: multistate-default
+    - name: multistate-page
+      slackConfigs:
+        - apiURL:
+            key: url
+            name: multistate-slack-webhook
+          channel: "#multistate-alerts"
+          sendResolved: true
+    - name: multistate-ticket
+      pagerdutyConfigs:
+        - routingKey:
+            key: integrationKey
+            name: multistate-pagerduty-key
+          severity: warning
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: multistate-slack-webhook
+  namespace: multistate-dev
+type: Opaque
+stringData:
+  url: "https://hooks.slack.com/services/PLACEHOLDER"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: multistate-pagerduty-key
+  namespace: multistate-dev
+type: Opaque
+stringData:
+  integrationKey: "PLACEHOLDER_PAGERDUTY_INTEGRATION_KEY"

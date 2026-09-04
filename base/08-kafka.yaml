@@ -1,0 +1,119 @@
+# manifests/08-kafka.yaml - the event backbone for the W3 D5 transactional outbox.
+#
+# Single-broker KRaft mode (no ZooKeeper), same shape as the Compose stack.
+# Unlike Postgres/Mongo/Redis this is NOT a startup-blocking dependency: the
+# Kafka producer/consumer connect lazily and retry, so the app boots and serves
+# reads with the broker still coming up. Spring Boot also ships no Kafka health
+# indicator, so the broker is deliberately absent from the readiness group —
+# see the `management.endpoint.health.group` block in application.yml.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: event-bus
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kafka
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/component: event-bus
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/component: event-bus
+        app.kubernetes.io/part-of: multistate
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.7.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_LISTENERS
+              value: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+            # Clients resolve the broker through the ClusterIP Service, so the
+            # advertised address must be the Service's cluster DNS name — not
+            # the pod IP, which changes on every reschedule.
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: PLAINTEXT://kafka.multistate-dev.svc.cluster.local:9092
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_LOG_DIRS
+              value: /var/lib/kafka/data
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              memory: 1536Mi
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1
+            # KRaft controller election takes noticeably longer than the other
+            # datastores' startup; don't lower this chasing a faster boot or
+            # the probe flaps during normal startup.
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 12
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

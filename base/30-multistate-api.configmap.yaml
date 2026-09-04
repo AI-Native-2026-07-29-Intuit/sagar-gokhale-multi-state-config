@@ -1,0 +1,69 @@
+# manifests/30-multistate-api.configmap.yaml - non-secret env.
+#
+# Plain key/value pairs, injected wholesale via `envFrom.configMapRef`.
+# Hostnames use in-cluster DNS (<service>.<namespace>.svc.cluster.local) and
+# resolve to the Services in 05-postgres/06-mongo/07-redis/08-kafka.yaml.
+#
+# Anything sensitive belongs in 40-multistate-api.secret.yaml, never here — a
+# ConfigMap is readable by anything with get access to the namespace and shows
+# up in plain text in `kubectl describe`.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multistate-api-config
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: multistate-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+data:
+  # `local` selects the application.yml document with the real datastore
+  # config (every value that differs in-cluster is overridden below). `k8s`
+  # is a SECOND active profile that matches no application.yml document —
+  # Spring Boot activates it anyway with no effect there, but
+  # logback-spring.xml's <springProfile name="k8s"> reads the SAME active-
+  # profile list and switches stdout to the JSON encoder Grafana Alloy scrapes
+  # (W5 D5 Task 2).
+  SPRING_PROFILES_ACTIVE: local,k8s
+  SERVER_PORT: "8080"
+  LOGGING_LEVEL_ROOT: INFO
+
+  # Graceful shutdown. The default is `immediate`, which closes Tomcat's
+  # connector the instant SIGTERM lands and severs requests already being
+  # served — during a rolling update those surface to the client as resets,
+  # not as retryable 503s. `graceful` stops accepting NEW connections but
+  # lets in-flight ones finish, which is the other half of the zero-downtime
+  # contract: the Deployment's preStop hook keeps the pod in rotation long
+  # enough for the endpoint removal to propagate, and this drains whatever
+  # arrived in the meantime. The phase timeout must stay comfortably inside
+  # terminationGracePeriodSeconds (45s) or the kubelet SIGKILLs mid-drain.
+  SERVER_SHUTDOWN: graceful
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s
+
+  # Postgres — application.yml builds the JDBC URL from DB_HOST/DB_PORT/DB_NAME.
+  DB_HOST: postgres.multistate-dev.svc.cluster.local
+  DB_PORT: "5432"
+  DB_NAME: multistate_dev
+  DB_USER: multistate_dev
+
+  # Mongo — the denormalised read model (W2 D5).
+  MONGO_HOST: mongo.multistate-dev.svc.cluster.local
+  MONGO_PORT: "27017"
+
+  # Redis — @Cacheable read path + idempotency keys.
+  REDIS_HOST: redis.multistate-dev.svc.cluster.local
+  REDIS_PORT: "6379"
+
+  # Kafka — the W3 D5 transactional outbox.
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka.multistate-dev.svc.cluster.local:9092
+  SPRING_KAFKA_CONSUMER_GROUP_ID: multistate-read-model-builder
+
+  # OTel — the W5 D5 collector lives in the `monitoring` namespace, installed
+  # by the kube-prometheus-stack + OTel Collector Helm prep step. Sampler
+  # tuning and the gRPC protocol override live in
+  # manifests/observability/multistate-api-deployment-patch.yaml (Task 3),
+  # applied as a strategic-merge patch on top of this Deployment.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.monitoring.svc.cluster.local:4318
+  OTEL_SERVICE_NAME: multistate-api

@@ -1,0 +1,47 @@
+# manifests/60-multistate-api.ingress.yaml - the one external entry point.
+#
+# This is the only object in the tree that fronts a load balancer. The
+# Service stays ClusterIP precisely so that stays true: `type: LoadBalancer`
+# on each Service would provision (and, on a real cloud, bill for) one LB per
+# service, and would bypass the shared routing, TLS and timeout policy that
+# lives here.
+#
+# The cluster is created with --port "8080:80@loadbalancer", which maps host
+# port 8080 to the NGINX controller inside k3d. Routing is by Host header, so
+# a request only reaches this rule if it carries the host below — hence the
+# `curl -H 'Host: ...'` in scripts/k8s-smoke.sh, which avoids needing an
+# /etc/hosts entry at all.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multistate-api
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: multistate-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    # Cap request bodies at the edge so an oversized upload is rejected by the
+    # proxy instead of occupying an app thread and heap all the way in.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Give up on an upstream that has gone quiet rather than holding the
+    # client connection open indefinitely.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  # ingressClassName, NOT the deprecated kubernetes.io/ingress.class
+  # annotation: the annotation form is ignored by newer controllers, which
+  # fails silently as an Ingress that simply never gets an address.
+  ingressClassName: nginx
+  rules:
+    - host: multistate.dev.uptimecrew.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: multistate-api
+                port:
+                  number: 8080

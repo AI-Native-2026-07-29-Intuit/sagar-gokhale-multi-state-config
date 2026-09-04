@@ -1,0 +1,37 @@
+# base/kustomization.yaml
+# The W5 D3 manifest set, copied verbatim from sagar-gokhale-multi-state/manifests/.
+# Deliberately unchanged across envs -- overlays/{dev,staging,prod} patch on top.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 04-postgres-init.configmap.yaml
+  - 05-postgres.yaml
+  - 06-mongo.yaml
+  - 07-redis.yaml
+  - 08-kafka.yaml
+  - 10-multistate-api.deployment.yaml
+  - 20-multistate-api.service.yaml
+  - 30-multistate-api.configmap.yaml
+  - 40-multistate-api.secret.yaml
+  - 50-multistate-api.hpa.yaml
+  - 60-multistate-api.ingress.yaml
+  - observability/multistate-api-servicemonitor.yaml
+  - observability/multistate-api-prometheusrule.yaml
+  - observability/multistate-api-alertmanagerconfig.yaml
+  - observability/multistate-api-dashboard-configmap.yaml
+  - observability/multistate-otel-collector-service.yaml
+
+# W5 D5's tracing tuning was previously applied imperatively via
+# `kubectl patch --patch-file`. GitOps replaces that with a declarative
+# strategic-merge patch so Argo CD (not a human running kubectl) owns it.
+# NOTE: this patch mounts a Secret (multistate-jwt-public-key) that is
+# NOT part of this repo -- it is minted out-of-band by
+# scripts/mint-smoke-jwt.sh in the app repo. Until W6 D3's ESO/IRSA lands,
+# that Secret must exist in-cluster before this Application will go Healthy.
+patches:
+  - path: observability/multistate-api-deployment-patch.yaml
+    target:
+      kind: Deployment
+      name: multistate-api

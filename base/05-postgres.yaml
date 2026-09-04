@@ -1,0 +1,149 @@
+# manifests/05-postgres.yaml - the app's primary datastore.
+#
+# WHY THIS FILE EXISTS: the deliverable's reference manifest tree only ships
+# multistate-api, but its own ConfigMap points SPRING_DATASOURCE_URL at
+# postgres.multistate-dev.svc.cluster.local. This app opens Postgres, Mongo and
+# Redis connections during context startup (Hibernate runs ddl-auto: validate,
+# and the Spring Data repositories are eager), so with nothing behind that DNS
+# name the pod doesn't come up degraded — it exits non-zero and CrashLoopBackOffs
+# forever. The W5 D2 brief's own forward hook says as much: "the same four
+# services become a Kubernetes Deployment + StatefulSet + Service set."
+#
+# StatefulSet rather than Deployment: this is the one component with durable
+# on-disk state, and a StatefulSet gives it a stable identity plus a
+# volumeClaimTemplate instead of a pod-lifetime emptyDir.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: multistate-dev
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: multistate
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: multistate
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: multistate_dev
+            - name: POSTGRES_USER
+              value: multistate_dev
+            # Same Secret the app reads, same key — one source of truth for the
+            # password, remapped to the name the postgres image expects rather
+            # than duplicated under a second key that could drift out of sync.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: multistate-api-secrets
+                  key: SPRING_DATASOURCE_PASSWORD
+            # The official image refuses to run initdb into a non-empty dir, and
+            # a mounted PVC always contains lost+found — so give PGDATA its own
+            # subdirectory of the mount rather than the mount root.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Consumed by pg-seed.sh; see 04-postgres-init.configmap.yaml.
+            - name: SEED_FILE
+              value: /seed/V2__seed.sql
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+            - name: seed
+              mountPath: /seed
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "multistate_dev", "-d", "multistate_dev"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "multistate_dev", "-d", "multistate_dev"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+            # Only the files the entrypoint should auto-run, renamed so their
+            # lexical order matches migration order. V2__seed.sql is
+            # deliberately NOT here — see the `seed` volume below.
+            items:
+              - key: V1__schema.sql
+                path: 01-schema.sql
+              - key: V3__event_outbox.sql
+                path: 02-outbox.sql
+              - key: V4__event_outbox_traceparent.sql
+                path: 03-outbox-traceparent.sql
+              - key: pg-seed.sh
+                path: 04-seed.sh
+        - name: seed
+          configMap:
+            name: postgres-init
+            # V2__seed.sql is mounted outside /docker-entrypoint-initdb.d on
+            # purpose: it contains two intentional constraint-violation demo
+            # blocks, which make psql exit non-zero. The entrypoint runs under
+            # `set -e`, so letting it auto-run that file aborts the whole init
+            # sequence and silently skips every migration after it. 04-seed.sh
+            # runs it explicitly with ON_ERROR_STOP=0 instead.
+            items:
+              - key: V2__seed.sql
+                path: V2__seed.sql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
