@@ -139,8 +139,12 @@ spec:
             items:
               - key: V2__seed.sql
                 path: V2__seed.sql
+  # See base/06-mongo.yaml's comment: apiVersion/kind declared explicitly
+  # so Argo CD's diff matches what the k8s v1.35 API server always returns.
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
