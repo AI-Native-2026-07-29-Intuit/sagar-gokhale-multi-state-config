@@ -91,8 +91,15 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 3
+  # apiVersion/kind on the embedded PVC template are declared explicitly
+  # (deviation from the app repo's manifests/06-mongo.yaml, which omits
+  # them) because the k8s v1.35 API server always returns them on read.
+  # Without this, Argo CD's diff sees live != git forever and selfHeal
+  # loops resyncing on a resource that never actually drifted.
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]

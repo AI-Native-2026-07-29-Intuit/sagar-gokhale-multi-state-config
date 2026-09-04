@@ -23,7 +23,15 @@ spec:
     - server: https://kubernetes.default.svc
       namespace: multistate-prod
 
-  clusterResourceWhitelist: []
+  # Namespace is the one cluster-scoped kind this project needs: base/
+  # declares it as a git-managed resource (00-namespace.yaml), and a
+  # cluster-scoped kind is checked against THIS list, not
+  # namespaceResourceWhitelist, regardless of which namespace it lands in.
+  # Discovered live: Task 1's first version of this file omitted it here
+  # and only listed it below, which fails sync with "resource :Namespace
+  # is not permitted in project multistate".
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
 
   # Kinds actually present in base/: includes StatefulSet + Ingress +
   # AlertmanagerConfig, which the curriculum reference snippet's list omits
@@ -32,7 +40,6 @@ spec:
   # deliberately whitelisted (not blacklisted as the curriculum suggests) --
   # see Task 2 note in GITOPS.md for why.
   namespaceResourceWhitelist:
-    - {group: "", kind: Namespace}
     - {group: "", kind: Service}
     - {group: "", kind: ConfigMap}
     - {group: "", kind: Secret}
