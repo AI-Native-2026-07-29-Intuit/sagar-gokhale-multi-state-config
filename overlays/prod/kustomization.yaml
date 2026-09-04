@@ -1,0 +1,49 @@
+# overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: multistate-prod
+
+commonAnnotations:
+  argocd.argoproj.io/sync-wave: "2"
+
+images:
+  - name: uptimecrew/multistate-api
+    newName: uptimecrew/multistate-api
+    newTag: "0.1.9"
+
+replicas:
+  - name: multistate-api
+    count: 3
+
+# See overlays/staging/kustomization.yaml for why SPRING_PROFILES_ACTIVE is
+# left unchanged and the datastore hostnames/DB name are patched explicitly.
+patches:
+  - target:
+      kind: ConfigMap
+      name: multistate-api-config
+    patch: |-
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: WARN
+      - op: replace
+        path: /data/DB_HOST
+        value: postgres.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/DB_NAME
+        value: multistate_prod
+      - op: replace
+        path: /data/DB_USER
+        value: multistate_prod
+      - op: replace
+        path: /data/MONGO_HOST
+        value: mongo.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/REDIS_HOST
+        value: redis.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/SPRING_KAFKA_BOOTSTRAP_SERVERS
+        value: kafka.multistate-prod.svc.cluster.local:9092

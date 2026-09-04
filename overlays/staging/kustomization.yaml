@@ -1,0 +1,56 @@
+# overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: multistate-staging
+
+commonAnnotations:
+  argocd.argoproj.io/sync-wave: "1"
+
+images:
+  - name: uptimecrew/multistate-api
+    newName: uptimecrew/multistate-api
+    newTag: "0.1.9"
+
+replicas:
+  - name: multistate-api
+    count: 2
+
+# The base ConfigMap hardcodes *.multistate-dev.svc.cluster.local hostnames
+# and the dev DB name -- Kustomize's namespace transformer only rewrites
+# metadata.namespace, not arbitrary strings inside ConfigMap data, so those
+# have to be patched explicitly per env or staging would talk to dev's
+# Postgres/Mongo/Redis/Kafka. SPRING_PROFILES_ACTIVE is intentionally left
+# as "local,k8s" (not rewritten to e.g. "staging,k8s") -- there's no
+# staging application.yml document in the app repo, and switching to an
+# undefined profile risks silently falling back to different (possibly
+# in-memory/test) datastore config. See GITOPS.md for this call.
+patches:
+  - target:
+      kind: ConfigMap
+      name: multistate-api-config
+    patch: |-
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: INFO
+      - op: replace
+        path: /data/DB_HOST
+        value: postgres.multistate-staging.svc.cluster.local
+      - op: replace
+        path: /data/DB_NAME
+        value: multistate_staging
+      - op: replace
+        path: /data/DB_USER
+        value: multistate_staging
+      - op: replace
+        path: /data/MONGO_HOST
+        value: mongo.multistate-staging.svc.cluster.local
+      - op: replace
+        path: /data/REDIS_HOST
+        value: redis.multistate-staging.svc.cluster.local
+      - op: replace
+        path: /data/SPRING_KAFKA_BOOTSTRAP_SERVERS
+        value: kafka.multistate-staging.svc.cluster.local:9092
