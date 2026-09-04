@@ -20,14 +20,23 @@ replicas:
     count: 2
 
 # The base ConfigMap hardcodes *.multistate-dev.svc.cluster.local hostnames
-# and the dev DB name -- Kustomize's namespace transformer only rewrites
-# metadata.namespace, not arbitrary strings inside ConfigMap data, so those
-# have to be patched explicitly per env or staging would talk to dev's
-# Postgres/Mongo/Redis/Kafka. SPRING_PROFILES_ACTIVE is intentionally left
-# as "local,k8s" (not rewritten to e.g. "staging,k8s") -- there's no
-# staging application.yml document in the app repo, and switching to an
-# undefined profile risks silently falling back to different (possibly
-# in-memory/test) datastore config. See GITOPS.md for this call.
+# -- Kustomize's namespace transformer only rewrites metadata.namespace, not
+# arbitrary strings inside ConfigMap data, so the hostnames have to be
+# patched explicitly per env or staging would talk to dev's
+# Postgres/Mongo/Redis/Kafka. DB_NAME/DB_USER are deliberately left as
+# multistate_dev/multistate_dev (NOT renamed to multistate_staging) --
+# base/05-postgres.yaml hardcodes POSTGRES_DB/POSTGRES_USER to
+# multistate_dev in every namespace (it's copied verbatim across overlays),
+# so renaming only the app's DB_NAME/DB_USER without also patching the
+# Postgres StatefulSet's own env caused "password authentication failed"
+# (Postgres has no multistate_staging role). Isolation between envs already
+# comes from each namespace running its own separate Postgres instance --
+# same DB name across envs inside those separate instances is harmless.
+# SPRING_PROFILES_ACTIVE is intentionally left as "local,k8s" (not rewritten
+# to e.g. "staging,k8s") -- there's no staging application.yml document in
+# the app repo, and switching to an undefined profile risks silently
+# falling back to different (possibly in-memory/test) datastore config. See
+# GITOPS.md for this call.
 patches:
   - target:
       kind: ConfigMap
@@ -39,12 +48,6 @@ patches:
       - op: replace
         path: /data/DB_HOST
         value: postgres.multistate-staging.svc.cluster.local
-      - op: replace
-        path: /data/DB_NAME
-        value: multistate_staging
-      - op: replace
-        path: /data/DB_USER
-        value: multistate_staging
       - op: replace
         path: /data/MONGO_HOST
         value: mongo.multistate-staging.svc.cluster.local

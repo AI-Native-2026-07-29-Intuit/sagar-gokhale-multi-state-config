@@ -19,8 +19,12 @@ replicas:
   - name: multistate-api
     count: 3
 
-# See overlays/staging/kustomization.yaml for why SPRING_PROFILES_ACTIVE is
-# left unchanged and the datastore hostnames/DB name are patched explicitly.
+# See overlays/staging/kustomization.yaml for why SPRING_PROFILES_ACTIVE and
+# DB_NAME/DB_USER are left unchanged (only the hostnames are patched) --
+# base/05-postgres.yaml hardcodes POSTGRES_DB/POSTGRES_USER to
+# multistate_dev in every namespace, so renaming only the app's side caused
+# "password authentication failed" against a Postgres role that doesn't
+# exist.
 patches:
   - target:
       kind: ConfigMap
@@ -32,12 +36,6 @@ patches:
       - op: replace
         path: /data/DB_HOST
         value: postgres.multistate-prod.svc.cluster.local
-      - op: replace
-        path: /data/DB_NAME
-        value: multistate_prod
-      - op: replace
-        path: /data/DB_USER
-        value: multistate_prod
       - op: replace
         path: /data/MONGO_HOST
         value: mongo.multistate-prod.svc.cluster.local
