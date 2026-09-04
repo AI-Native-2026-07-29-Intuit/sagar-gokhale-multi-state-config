@@ -1,0 +1,89 @@
+# argocd/applicationsets/multistate-api-envs.yaml
+# Templates one Application per env. Adding a new env is a one-line entry
+# in the list generator's elements. Supersedes the standalone
+# argocd/applications/multistate-api-dev.yaml Application from Task 1 --
+# delete that Application once this ApplicationSet's dev copy is Healthy,
+# or the two will race over the same destination.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: multistate-api-envs
+  namespace: argocd
+spec:
+  # If an env falls out of the matrix, keep the existing Application +
+  # workload running; a human re-reviews before any teardown. The default
+  # (delete) is the wrong default for prod.
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - env: dev
+                  overlay: overlays/dev
+                  namespace: multistate-dev
+                  wave: "0"
+                - env: staging
+                  overlay: overlays/staging
+                  namespace: multistate-staging
+                  wave: "1"
+                - env: prod
+                  overlay: overlays/prod
+                  namespace: multistate-prod
+                  wave: "2"
+          - clusters:
+              selector:
+                matchLabels:
+                  uptimecrew.example.internal/tier: workload
+
+  template:
+    metadata:
+      name: "multistate-api-{{.env}}"
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{.wave}}"
+      labels:
+        env: "{{.env}}"
+        team: multistate
+    spec:
+      project: multistate
+      source:
+        repoURL: https://github.com/AI-Native-2026-07-29-Intuit/sagar-gokhale-multi-state-config.git
+        path: "{{.overlay}}"
+        targetRevision: main
+      destination:
+        server: "{{.server}}"
+        namespace: "{{.namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+      # The HPA in base/ owns spec.replicas at runtime in every env; without
+      # this, selfHeal fights the HPA on each reconcile (see the Task 1
+      # Application's comment for the full explanation).
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          name: multistate-api
+          namespace: "{{.namespace}}"
+          jsonPointers:
+            - /spec/replicas
