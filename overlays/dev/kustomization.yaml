@@ -18,4 +18,3 @@ images:
   - name: uptimecrew/multistate-api
     newName: uptimecrew/multistate-api
     newTag: "0.1.9"
-   badIndent: this line is deliberately mis-indented to break YAML parsing
