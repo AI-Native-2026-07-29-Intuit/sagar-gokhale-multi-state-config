@@ -65,6 +65,6 @@ data:
         }]
 
   subscriptions: |
-    - recipients: [slack:multistate-deploys]
+    - recipients: [slack:multistate-deploys-sagar]
       triggers: [on-sync-failed, on-health-degraded]
       selector: "team=multistate"
