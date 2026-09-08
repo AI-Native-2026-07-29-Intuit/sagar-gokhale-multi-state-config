@@ -1,0 +1,47 @@
+# overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: multistate-prod
+
+commonAnnotations:
+  argocd.argoproj.io/sync-wave: "2"
+
+images:
+  - name: uptimecrew/multistate-api
+    newName: uptimecrew/multistate-api
+    newTag: "0.1.9"
+
+replicas:
+  - name: multistate-api
+    count: 3
+
+# See overlays/staging/kustomization.yaml for why SPRING_PROFILES_ACTIVE and
+# DB_NAME/DB_USER are left unchanged (only the hostnames are patched) --
+# base/05-postgres.yaml hardcodes POSTGRES_DB/POSTGRES_USER to
+# multistate_dev in every namespace, so renaming only the app's side caused
+# "password authentication failed" against a Postgres role that doesn't
+# exist.
+patches:
+  - target:
+      kind: ConfigMap
+      name: multistate-api-config
+    patch: |-
+      - op: replace
+        path: /data/LOGGING_LEVEL_ROOT
+        value: WARN
+      - op: replace
+        path: /data/DB_HOST
+        value: postgres.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/MONGO_HOST
+        value: mongo.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/REDIS_HOST
+        value: redis.multistate-prod.svc.cluster.local
+      - op: replace
+        path: /data/SPRING_KAFKA_BOOTSTRAP_SERVERS
+        value: kafka.multistate-prod.svc.cluster.local:9092

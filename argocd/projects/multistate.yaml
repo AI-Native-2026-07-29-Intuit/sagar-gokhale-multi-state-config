@@ -1,8 +1,7 @@
 # argocd/projects/multistate.yaml
 # AppProject scoping the multistate capstone team. Every Application in this
 # assignment sets spec.project: multistate -- never "default".
-# Task 1: a working-but-loose project just enough to sync the dev
-# Application. Task 2 tightens clusterResourceWhitelist/RBAC/syncWindows.
+# Task 2 adds the RBAC roles + prod syncWindow on top of Task 1's allow-lists.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
@@ -24,7 +23,15 @@ spec:
     - server: https://kubernetes.default.svc
       namespace: multistate-prod
 
-  clusterResourceWhitelist: []
+  # Namespace is the one cluster-scoped kind this project needs: base/
+  # declares it as a git-managed resource (00-namespace.yaml), and a
+  # cluster-scoped kind is checked against THIS list, not
+  # namespaceResourceWhitelist, regardless of which namespace it lands in.
+  # Discovered live: Task 1's first version of this file omitted it here
+  # and only listed it below, which fails sync with "resource :Namespace
+  # is not permitted in project multistate".
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
 
   # Kinds actually present in base/: includes StatefulSet + Ingress +
   # AlertmanagerConfig, which the curriculum reference snippet's list omits
@@ -33,7 +40,6 @@ spec:
   # deliberately whitelisted (not blacklisted as the curriculum suggests) --
   # see Task 2 note in GITOPS.md for why.
   namespaceResourceWhitelist:
-    - {group: "", kind: Namespace}
     - {group: "", kind: Service}
     - {group: "", kind: ConfigMap}
     - {group: "", kind: Secret}
@@ -49,3 +55,39 @@ spec:
     - {group: monitoring.coreos.com, kind: ServiceMonitor}
     - {group: monitoring.coreos.com, kind: PrometheusRule}
     - {group: monitoring.coreos.com, kind: AlertmanagerConfig}
+
+  # Deny auto-sync to prod over the weekend. Manual sync still works
+  # (manualSync: true) for genuine on-call need; the controller just won't
+  # promote on its own during the window.
+  syncWindows:
+    - kind: deny
+      schedule: "0 17 * * 5"        # Friday 17:00 UTC
+      duration: 60h                 # through Monday 05:00 UTC
+      applications:
+        - "multistate-api-prod"
+      manualSync: true
+
+  # Project-scoped RBAC -- two roles, not "any-developer-is-admin".
+  # Group bindings are inert until OIDC is wired to Argo CD (W6D3 lands the
+  # cluster's OIDC provider); they document intent for the platform team
+  # until then.
+  roles:
+    - name: developers
+      description: Read everything; sync dev and staging only.
+      policies:
+        - p, proj:multistate:developers, applications, get,    multistate/*, allow
+        - p, proj:multistate:developers, applications, sync,   multistate/multistate-api-dev, allow
+        - p, proj:multistate:developers, applications, sync,   multistate/multistate-api-staging, allow
+        - p, proj:multistate:developers, applications, delete, multistate/*, deny
+        - p, proj:multistate:developers, logs, get, multistate/*, allow
+      groups:
+        - uptimecrew:multistate-engineers
+    - name: releasers
+      description: Full sync including prod. Cannot delete Applications.
+      policies:
+        - p, proj:multistate:releasers, applications, get,      multistate/*, allow
+        - p, proj:multistate:releasers, applications, sync,     multistate/*, allow
+        - p, proj:multistate:releasers, applications, action/*, multistate/*, allow
+        - p, proj:multistate:releasers, applications, delete,   multistate/*, deny
+      groups:
+        - uptimecrew:multistate-engineers-releasers

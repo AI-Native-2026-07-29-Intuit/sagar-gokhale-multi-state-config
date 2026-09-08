@@ -1,0 +1,46 @@
+# .github/workflows/validate-overlays.yml
+# Catches a broken overlay at PR time instead of waiting for Argo CD to
+# discover it during reconciliation (which surfaces as a ComparisonError
+# on the live Application, not a CI failure someone reviews before merge).
+name: validate-overlays
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  kustomize-build:
+    name: kustomize build + kubeconform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        overlay: [dev, staging, prod]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2.1.0
+
+      - name: kustomize build overlays/${{ matrix.overlay }}
+        run: kustomize build "overlays/${{ matrix.overlay }}" > "/tmp/${{ matrix.overlay }}.yaml"
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL \
+            "https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin kubeconform
+
+      # -schema-location default + the CRDs-catalog mirror: ServiceMonitor,
+      # PrometheusRule, and AlertmanagerConfig are CRDs with no schema in
+      # kubeconform's built-in catalog, so they'd otherwise error rather
+      # than validate.
+      - name: kubeconform rendered manifest
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "/tmp/${{ matrix.overlay }}.yaml"
